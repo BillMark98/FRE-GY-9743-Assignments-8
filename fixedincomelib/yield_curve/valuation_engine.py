@@ -201,13 +201,32 @@ class ValuationEngineProductRfrSwap(ValuationEngineProduct):
         self.cash_ = (
             self.fixed_leg_sign_ * self.fixed_cash_ + self.floating_leg_sign_ * self.float_cash_
         )
-        # TODO 2a: Set self.annuity_ to the fixed-leg annuity per unit notional.
-        # Use the nonzero fixed coupon and the fixed-leg PV already calculated.
-        raise NotImplementedError("TODO 2a: calculate the fixed-leg annuity")
+        # HW8 task 2a: fixed-leg annuity per unit notional,
+        #   A = sum_i alpha_i * D_f(pay_i)      (remaining fixed coupons only).
+        # The fixed leg pays N * K * alpha_i, so PV_fixed = N * K * A and the
+        # annuity is read off the leg PV already calculated: A = PV_fixed / (K * N).
+        # fixed_value_ is the UNSIGNED leg PV (direction lives in the leg signs),
+        # so A is positive for either pay or receive.  It inherits the stream
+        # engine's lifecycle rules: past coupons drop out, a coupon paid today
+        # counts with D = 1.
+        # With K = 0 the leg PV is identically zero and carries no information;
+        # the same sum is then taken from the stream engine's accruals and DFs,
+        # so a zero-coupon swap can still be valued and quoted.
+        if self.fixed_rate_ != 0.0:
+            self.annuity_ = self.fixed_value_ / (self.fixed_rate_ * self.notional_)
+        else:
+            self.annuity_ = float(np.dot(self.fixed_leg_engine_.accruals_, self.fixed_leg_engine_.dfs_))
 
-        # TODO 2b: Set self.par_rate_or_spread_ to the OIS par rate in decimals.
-        # Use the floating-leg PV and the annuity from TODO 2a.
-        raise NotImplementedError("TODO 2b: calculate the OIS par rate")
+        # HW8 task 2b: OIS par rate in decimals.  The par rate K* is the fixed
+        # coupon that makes the swap worth zero:  N * K* * A = PV_float, hence
+        #   K* = PV_float / (N * A).
+        # PV_float includes any floating spread, so K* is the fair fixed rate
+        # against "index + spread".  With no remaining fixed coupon (A = 0) the
+        # par rate is undefined and reported as NaN instead of a made-up number.
+        if self.annuity_ != 0.0:
+            self.par_rate_or_spread_ = self.float_value_ / (self.annuity_ * self.notional_)
+        else:
+            self.par_rate_or_spread_ = float("nan")
 
     def calculate_first_order_risk(
         self, gradient=None, scaler: float = 1.0, accumulate: bool = False
@@ -238,10 +257,47 @@ class ValuationEngineProductRfrSwap(ValuationEngineProduct):
         local_grad = []
         self.model_.resize_gradient(local_grad)
 
-        # TODO 2c: Accumulate the OIS par-rate gradient with respect to X^I
-        # in local_grad. Apply the quotient rule using both leg engines,
-        # keeping the fixed coupon constant and the model's component order.
-        raise NotImplementedError("TODO 2c: calculate the OIS par-rate gradient")
+        # HW8 task 2c: gradient of the par rate K* = PV_float / (N * A) with
+        # respect to the internal state X^I, one block per model component in
+        # the model's component order (resize_gradient fixes that layout).
+        #
+        # Quotient rule, with the fixed coupon K held constant:
+        #   grad K* = grad(PV_float) / (N A)  -  K* * grad(N A) / (N A)
+        # and, because PV_fixed = K * (N A) with K constant,
+        #   grad(N A) = grad(PV_fixed) / K.
+        # Both leg gradients come from the leg engines' own first-order risk,
+        # called with accumulate=True and the scalers
+        #   floating:  +1 / (N A)
+        #   fixed:     -K* / (N A K)
+        # The leg engines differentiate the UNSIGNED leg PVs, so no pay/receive
+        # sign enters: the par rate does not depend on the trade direction.
+        #
+        # Refresh the value first: annuity_ and par_rate_or_spread_ must belong
+        # to the model's current state, which a solver or a bump may have moved
+        # since the last calculate_value().
+        self.calculate_value()
+        annuity_notional = self.annuity_ * self.notional_
+        self.floating_leg_engine_.calculate_first_order_risk(
+            local_grad, scaler=1.0 / annuity_notional, accumulate=True
+        )
+        if self.fixed_rate_ != 0.0:
+            self.fixed_leg_engine_.calculate_first_order_risk(
+                local_grad,
+                scaler=-self.par_rate_or_spread_ / (annuity_notional * self.fixed_rate_),
+                accumulate=True,
+            )
+        else:
+            # K = 0: the fixed-leg PV and its gradient vanish, so differentiate
+            # the annuity directly:  grad A = sum_i alpha_i * grad D_f(pay_i).
+            fixed = self.fixed_leg_engine_
+            for i in range(fixed.stream_.num_cashflows()):
+                payment_date = fixed.stream_.cashflow(i).payment_date
+                if payment_date > self.value_date:
+                    self.model_.discount_factor_gradient_wrt_state(
+                        fixed.funding_index_, payment_date, local_grad,
+                        scaler=-self.par_rate_or_spread_ * fixed.accruals_[i] / self.annuity_,
+                        accumulate=True,
+                    )
 
         return local_grad
 
